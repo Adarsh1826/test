@@ -5,6 +5,7 @@ import type { Session } from "next-auth";
 
 export default function NextAuthSessionProvider({
   children,
+  
   session,
 }: {
   children: React.ReactNode

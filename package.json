@@ -7,7 +7,6 @@
     "dev": "next dev",
     "lint": "next lint",
     "start": "next start",
-    "postbuild": "next-sitemap",
     "analyze": "ANALYZE=true next build"
   },
   "dependencies": {

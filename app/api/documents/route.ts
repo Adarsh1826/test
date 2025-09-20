@@ -1,129 +1,108 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { connectToDatabase } from "@/lib/mongodb";
-import Document from "@/models/Document";
-import { writeFile, mkdir } from "fs/promises";
-import { join } from "path";
-import { existsSync } from "fs";
-import { uploadToCloudinary } from "@/lib/cloudinary";
+import { NextRequest, NextResponse } from "next/server"
+import { getServerSession } from "next-auth"
+import { authOptions } from "@/lib/auth"
+import { connectToDatabase } from "@/lib/mongodb"
+import Document from "@/models/Document"
+import { writeFile, mkdir, unlink } from "fs/promises"
+import { join } from "path"
+import { existsSync } from "fs"
+import cloudinary from "@/lib/cloudinary"
 
-// Ensure Node.js runtime (required for fs, Buffer, and pdf-parse)
-export const runtime = "nodejs";
+export const runtime = "nodejs"
 
+// ========== UPLOAD ==========
 export async function POST(request: NextRequest) {
   try {
-    // Check authentication
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    // Connect to database
-    await connectToDatabase();
+    const session = await getServerSession(authOptions)
+    if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
-    // Parse form data
-    const formData = await request.formData();
-    const file = formData.get("file") as File;
-    
-    if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 });
-    }
+    await connectToDatabase()
 
-    // Validate file type (some environments may not provide file.type reliably)
-    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-    if (!isPdf) {
-      return NextResponse.json({ error: "Only PDF files are allowed (.pdf)" }, { status: 400 });
-    }
+    const formData = await request.formData()
+    const file = formData.get("file") as File
+    if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 })
 
-    // Validate file size (10MB limit)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (file.size > maxSize) {
-      return NextResponse.json({ error: "File size must be less than 10MB" }, { status: 400 });
-    }
+    // Validate file
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
+    if (!isPdf) return NextResponse.json({ error: "Only PDF files allowed" }, { status: 400 })
+    if (file.size > 10 * 1024 * 1024)
+      return NextResponse.json({ error: "File size must be <10MB" }, { status: 400 })
 
-    // Generate unique filename
-    const timestamp = Date.now();
-    const randomString = Math.random().toString(36).substring(2, 15);
-    const fileExtension = file.name.split('.').pop();
-    const fileName = `${timestamp}_${randomString}.${fileExtension}`;
-    
-    let filePath: string;
-    let fileUrl: string | undefined;
-    // Read bytes once for later parsing and potential local write
-    const bytes = await file.arrayBuffer();
-    const buffer = Buffer.from(bytes);
-    
-    // Choose storage method based on environment
-    if (process.env.NODE_ENV === "production" && process.env.CLOUDINARY_CLOUD_NAME) {
-      // Use Cloudinary for production
-      try {
-        const uploadResult = await uploadToCloudinary(file);
-        filePath = uploadResult.public_id;
-        fileUrl = uploadResult.secure_url;
-      } catch (cloudError) {
-        console.error("Cloudinary upload failed, falling back to local storage:", cloudError);
-        // Fallback to local storage
-        const uploadsDir = join(process.cwd(), "public", "uploads", "documents");
-        if (!existsSync(uploadsDir)) {
-          await mkdir(uploadsDir, { recursive: true });
-        }
-        filePath = join(uploadsDir, fileName);
-        await writeFile(filePath, buffer);
-        filePath = `/uploads/documents/${fileName}`;
-      }
+    // Unique name
+    const timestamp = Date.now()
+    const randomString = Math.random().toString(36).substring(2, 15)
+    const ext = file.name.split(".").pop()
+    const fileName = `${timestamp}_${randomString}.${ext}`
+
+    const bytes = await file.arrayBuffer()
+    const buffer = Buffer.from(bytes)
+
+    let filePath: string
+    let fileUrl: string | undefined
+
+    if (process.env.NODE_ENV === "production") {
+      // ✅ Upload to Cloudinary
+      const result: any = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: "studymate/documents",
+            resource_type: "raw",
+            public_id: fileName,
+          },
+          (err, res) => {
+            if (err) reject(err)
+            else resolve(res)
+          }
+        )
+        stream.end(buffer)
+      })
+
+      filePath = result.public_id
+      fileUrl = result.secure_url
     } else {
-      // Use local storage for development
-      const uploadsDir = join(process.cwd(), "public", "uploads", "documents");
-      if (!existsSync(uploadsDir)) {
-        await mkdir(uploadsDir, { recursive: true });
-      }
-      filePath = join(uploadsDir, fileName);
-      await writeFile(filePath, buffer);
-      filePath = `/uploads/documents/${fileName}`;
+      // ✅ Local dev storage
+      const uploadsDir = join(process.cwd(), "public", "uploads", "documents")
+      if (!existsSync(uploadsDir)) await mkdir(uploadsDir, { recursive: true })
+      const localPath = join(uploadsDir, fileName)
+      await writeFile(localPath, buffer)
+      filePath = `/uploads/documents/${fileName}`
     }
 
-    // Save document info to database (initially processing)
+    // ✅ Save metadata
     const document = new Document({
-      name: file.name.replace(/\.[^/.]+$/, ""), // Remove extension for display name
+      name: file.name.replace(/\.[^/.]+$/, ""),
       originalName: file.name,
-      fileName: fileName,
-      filePath: filePath,
-      fileUrl: fileUrl,
+      fileName,
+      filePath,
+      fileUrl,
       fileSize: file.size,
       mimeType: file.type,
       userId: session.user.id,
       status: "processing",
-    });
+    })
+    await document.save()
 
-    await document.save();
-
+    // ✅ Parse PDF text
     try {
-      // Use pdf-parse via dynamic import and Next.js server externals to avoid bundling pitfalls
-      const { default: pdfParse } = await import("pdf-parse");
-      const parsed = await pdfParse(buffer as any);
-      const extractedText = (parsed?.text || "").trim();
+      const { default: pdfParse } = await import("pdf-parse")
+      const parsed = await pdfParse(buffer as any)
+      document.extractedText = (parsed?.text || "").trim()
+      document.status = "completed"
+      document.processedDate = new Date()
+      await document.save()
 
-      document.extractedText = extractedText;
-      document.status = "completed";
-      document.processedDate = new Date();
-      await document.save();
-
-      // Kick off background ingestion (embeddings)
-      try {
-        await fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/ingest`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ documentId: String(document._id) })
-        }).catch(() => undefined);
-      } catch {
-        // ignore background trigger errors
-      }
-    } catch (parseErr: any) {
-      console.error("PDF parse error:", parseErr);
-      document.status = "error";
-      document.errorMessage = `Failed to extract text from PDF: ${parseErr?.message || "unknown error"}`;
-      await document.save();
-      return NextResponse.json({ success: false, error: document.errorMessage }, { status: 500 });
+      // Trigger background ingestion
+      fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documentId: String(document._id) }),
+      }).catch(() => undefined)
+    } catch (err: any) {
+      console.error("PDF parse error:", err)
+      document.status = "error"
+      document.errorMessage = `Failed to extract text: ${err.message || "unknown error"}`
+      await document.save()
+      return NextResponse.json({ success: false, error: document.errorMessage }, { status: 500 })
     }
 
     return NextResponse.json({
@@ -137,157 +116,98 @@ export async function POST(request: NextRequest) {
         status: document.status,
         uploadDate: document.uploadDate,
         filePath: document.filePath,
-        extractedText: document.extractedText ?? null,
-        errorMessage: document.errorMessage ?? null,
+        fileUrl: document.fileUrl,
       },
-    });
-
-  } catch (error) {
-    console.error("Upload error:", error);
-    return NextResponse.json(
-      { error: "Failed to upload file" },
-      { status: 500 }
-    );
+    })
+  } catch (err) {
+    console.error("Upload error:", err)
+    return NextResponse.json({ error: "Failed to upload file" }, { status: 500 })
   }
 }
 
+// ========== UPDATE ==========
 export async function PUT(request: NextRequest) {
   try {
-    // Check authentication
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+    const session = await getServerSession(authOptions)
+    if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
-    // Connect to database
-    await connectToDatabase();
+    await connectToDatabase()
+    const { id, extractedText, status, ingest } = await request.json()
+    if (!id) return NextResponse.json({ error: "Document ID required" }, { status: 400 })
 
-    const { id, extractedText, status, ingest } = await request.json();
-    if (!id) {
-      return NextResponse.json({ error: "Document ID required" }, { status: 400 });
-    }
-
-    const update: any = {};
-    if (typeof extractedText === 'string') update.extractedText = extractedText;
-    if (typeof status === 'string') update.status = status;
-    if (Object.keys(update).length === 0) {
-      return NextResponse.json({ error: "No updates provided" }, { status: 400 });
-    }
+    const update: any = {}
+    if (typeof extractedText === "string") update.extractedText = extractedText
+    if (typeof status === "string") update.status = status
+    if (!Object.keys(update).length) return NextResponse.json({ error: "No updates provided" }, { status: 400 })
 
     const doc = await Document.findOneAndUpdate(
       { _id: id, userId: session.user.id },
       { $set: update },
       { new: true }
-    );
+    )
+    if (!doc) return NextResponse.json({ error: "Document not found" }, { status: 404 })
 
-    if (!doc) {
-      return NextResponse.json({ error: "Document not found" }, { status: 404 });
+    if (ingest && doc.extractedText?.trim()) {
+      fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documentId: doc._id }),
+      }).catch(() => undefined)
     }
 
-    // Optionally trigger ingestion of embeddings
-    if (ingest && typeof doc.extractedText === 'string' && doc.extractedText.trim().length > 0) {
+    return NextResponse.json({ success: true, document: doc })
+  } catch (err) {
+    console.error("Update error:", err)
+    return NextResponse.json({ error: "Failed to update document" }, { status: 500 })
+  }
+}
+
+// ========== GET ==========
+export async function GET(request: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions)
+    if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+
+    await connectToDatabase()
+    const documents = await Document.find({ userId: session.user.id }).sort({ uploadDate: -1 }).lean()
+    return NextResponse.json({ documents })
+  } catch (err) {
+    console.error("Get documents error:", err)
+    return NextResponse.json({ error: "Failed to fetch documents" }, { status: 500 })
+  }
+}
+
+// ========== DELETE ==========
+export async function DELETE(request: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions)
+    if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+
+    await connectToDatabase()
+    const { searchParams } = new URL(request.url)
+    const documentId = searchParams.get("id")
+    if (!documentId) return NextResponse.json({ error: "Document ID required" }, { status: 400 })
+
+    const document = await Document.findOneAndDelete({ _id: documentId, userId: session.user.id })
+    if (!document) return NextResponse.json({ error: "Document not found" }, { status: 404 })
+
+    // ✅ Delete file
+    if (process.env.NODE_ENV === "production" && document.filePath) {
       try {
-        await fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/ingest`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ documentId: doc._id })
-        }).catch(() => undefined);
-      } catch {
-        // ignore background trigger errors
+        await cloudinary.uploader.destroy(document.filePath, { resource_type: "raw" })
+      } catch (err) {
+        console.error("Cloudinary delete error:", err)
+      }
+    } else if (document.filePath?.startsWith("/uploads")) {
+      const localPath = join(process.cwd(), "public", document.filePath)
+      if (existsSync(localPath)) {
+        await unlink(localPath)
       }
     }
 
-    return NextResponse.json({ success: true, document: {
-      id: doc._id,
-      name: doc.name,
-      originalName: doc.originalName,
-      fileName: doc.fileName,
-      fileSize: doc.fileSize,
-      status: doc.status,
-      uploadDate: doc.uploadDate,
-      filePath: doc.filePath,
-      extractedText: doc.extractedText ?? null,
-      errorMessage: doc.errorMessage ?? null,
-    } });
-
-  } catch (error) {
-    console.error("Update document error:", error);
-    return NextResponse.json(
-      { error: "Failed to update document" },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: true })
+  } catch (err) {
+    console.error("Delete error:", err)
+    return NextResponse.json({ error: "Failed to delete document" }, { status: 500 })
   }
 }
-
-export async function GET(request: NextRequest) {
-  try {
-    // Check authentication
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // Connect to database
-    await connectToDatabase();
-
-    // Get user's documents
-    const documents = await Document.find({ userId: session.user.id })
-      .sort({ uploadDate: -1 })
-      .lean();
-
-    return NextResponse.json({ documents });
-
-  } catch (error) {
-    console.error("Get documents error:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch documents" },
-      { status: 500 }
-    );
-  }
-}
-
-export async function DELETE(request: NextRequest) {
-  try {
-    // Check authentication
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // Connect to database
-    await connectToDatabase();
-
-    const { searchParams } = new URL(request.url);
-    const documentId = searchParams.get("id");
-
-    if (!documentId) {
-      return NextResponse.json({ error: "Document ID required" }, { status: 400 });
-    }
-
-    // Find and delete document
-    const document = await Document.findOneAndDelete({
-      _id: documentId,
-      userId: session.user.id, // Ensure user can only delete their own documents
-    });
-
-    if (!document) {
-      return NextResponse.json({ error: "Document not found" }, { status: 404 });
-    }
-
-    // TODO: Delete the actual file from disk
-    // const filePath = join(process.cwd(), "public", document.filePath);
-    // if (existsSync(filePath)) {
-    //   await unlink(filePath);
-    // }
-
-    return NextResponse.json({ success: true });
-
-  } catch (error) {
-    console.error("Delete document error:", error);
-    return NextResponse.json(
-      { error: "Failed to delete document" },
-      { status: 500 }
-    );
-  }
-}
-
